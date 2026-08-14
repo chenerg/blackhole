@@ -1,0 +1,13 @@
+{
+  "action_chunk_size": 16,
+  "domain_name": "bridge_orig_lerobot",
+  "fps": 5,
+  "image_size": 480,
+  "view_point": "ego_view",
+  "model_mode": "policy",
+  "name": "policy_task1",
+  "prompt": "Put the pot to the left of the purple item.",
+  "seed": 0,
+  "vision_path": "vision.mp4",
+  "action_path": "action.json"
+}
