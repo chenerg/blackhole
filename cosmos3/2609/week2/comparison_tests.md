@@ -17,7 +17,7 @@
 4. [TND gather 链条（09/10–09/11）](#4-tnd-gather-链条0910-0911)
 5. [VAE pack / prefetch / sidestream（09/11）](#5-vae-pack--prefetch--sidestream0911)
 6. [nw=8 ablation 与预存 VAE（09/13）](#6-nw8-ablation-与预存-vae0913)
-7. [480p 11-step 优化 1/2/3/5（09/14）](#7-480p-11-step-优化-12350914)
+7. [在线 VAE：256p/480p × TND/per_sample（09/14）](#7-256p-vs-480p-与-480p-优化0914)
 8. [预存 VAE：指纹 / episode-id / worker-load（09/14）](#8-预存-vae指纹--episode-id--worker-load0914)
 9. [40-step 复核（09/14）](#9-40-step-复核0914)
 10. [4 卡 max-token：256/480 × TND/per_sample（09/14–09/15）](#10-4-卡-max-token256480--tndper_sample0914-0915)
@@ -407,7 +407,61 @@ cache：`/data5T/chenzhi/vae_latent_cache_droid_edge_256`。原始 success 视�
 
 ---
 
-## 7. 480p 11-step 优化 1/2/3/5（09/14）
+## 7. 256p vs 480p 与 480p 优化（09/14）
+
+### 7.1 在线 VAE（不预存）：256p / 480p × TND / per_sample
+
+全部 **`encode_vision_latents=false`**，VAE 在 `training_step`。无预存 cache、无 packing 侧预编。
+
+#### 8 卡 packing 48000，S/K 随机
+
+S∈[1,4]、K∈[1,32] Uniform。256p `nw=8 pf=2`，480p `nw=8 pf=1`。git `6565bf5`。
+
+| 分辨率 | kernel | avg_skip1 | min–max | 峰值 HBM | RSS | n | run |
+| --- | --- | ---: | --- | ---: | ---: | ---: | --- |
+| 256p | **TND** | **23.30**（21-step）；2..11 **24.61** | 20.5–27.9 | **65508** | 491 | 21 | `162502` |
+| 256p | per_sample | **29.85**；2..11 **29.29** | 24.5–35.5 | **65465** | 496 | 21 | `161144` |
+| 480p | **TND** | **31.67**（11-step） | 25.2–40.6 | **63959** | **379** | 11 | `020622` |
+| 480p | per_sample | **未测** | — | — | — | — | 没有 8 卡 480p + 在线 VAE + per_sample |
+
+256p TND vs per_sample：**−6.55 s（−22%）**，HBM/RSS 几乎一样。480p TND vs 256p TND（同 11-step）：**1.29×**，HBM 480p 略低（63959 vs 65508）。
+
+#### 4 卡同约 48000 token：唯一完整 2×2
+
+VAE 仍在网络里。一条强制长度样本，**钉死 S=4、K=32**。5 step，avg = iter 2..5。
+
+| 分辨率 | kernel | T | pre-TF | status | 2–5 均 | 峰值 HBM | RSS | run |
+| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| 256p | TND | 2257 | 47956 | **oom** step1 | — | 64489 | 41 | `140920` |
+| 256p | TND | 2233 | 47452 | ok | **43.61** | **65512** | 49 | `n558` |
+| 256p | per_sample | 2257 | 47956 | ok | **76.45** | **58444** | 49 | `002513` |
+| 480p | TND | 477 | 47896 | ok | **35.97** | **65513** | 73 | `003428` |
+| 480p | per_sample | 477 | 47896 | ok | **73.23** | **64127** | 72 | `004012` |
+
+- 480p TND vs per_sample：**35.97 vs 73.23（−51%）**，两边都装得下。
+- 256p：同 T=2257 TND **VAE OOM**、per_sample 76.45 s / 58 GiB → 墙在 VAE/T，不在 TND。T=2233 时 TND 43.61 vs per_sample 76.45（−43%）。
+- 钉死最大 history 后 480p TND 比 256p TND **更快**（36 vs 44 s）；8 卡日常 packing 相反（24.6 vs 31.7 s）。
+
+### 7.1b 仅 TND：256p vs 480p 其它路径（含预存）
+
+S/K Uniform，8 卡 TND、cap 48000。256p `pf=2`，480p 关 pack `pf=1`。256p 关 pack 21-step，480p 11-step；「同 11-step」用 256p iter 2..11。
+
+| 路径 | 卡 | 256p avg | 256p HBM / RSS | 480p avg | 480p HBM / RSS | 480÷256 | run 256 / 480 |
+| --- | ---: | ---: | --- | ---: | --- | ---: | --- |
+| **关 pack 在线** | 8 | **23.30**（21-step）；2..11 **24.61** | **65508** / 491 | **31.67** | **63959** / **379** | **1.29×** | `162502` / `020622` |
+| pack+sidestream | 8 | 24.21 | 65530 / 499 | 34.11 | 65512 / 418 | 1.41× | `134951` / `013436` |
+| 指纹 cache 11-step | 8 | **19.22** | 65501 / 478 | **23.71** | **62982** / 471 | **1.23×** | `050033` / `043731` |
+| episode-id 11-step | 8 | 20.93 | 63785 / **152** | 24.51 | 63766 / **153** | 1.17× | `090054` / `072856` |
+| episode-id 40-step | 8 | 19.81 | 65531 / 153 | 27.95 | 65510 / 155 | 1.41× | `093801` / `101314` |
+| worker-load 40-step | 4 | 18.93 | 65527 / 77 | 25.59 | 65506 / 77 | 1.35× | `121811` / `125719` |
+
+关 pack 256p min/max 20.5–27.9（spread 7.4）；480p 25.2–40.6（spread 15.4）。指纹 cache 256p 14.2–23.5；480p 14.7–32.4。
+
+- **时间**：日常 480p 是 256p 的 **1.2–1.4×**。慢在 VAE 空间和 480p 长包，不是 token 数。预存后收到 1.23× / 1.17×。
+- **HBM**：packing 48000 两边都常贴 64 GiB。480p 关 pack **63959 < 256p 65508**（T 短，VAE workspace 轻）。不要和 §10 把 256p 拉到 T=2233 去撞 VAE 墙混读。
+- **RSS**：解 AV1 时 480p 更低（帧少）。skip-video 后两边都 ~150 GiB（8 卡）/ ~77 GiB（4 卡）。
+
+### 7.2 480p 11-step 优化 1/2/3/5
 
 对照 baseline `20260914_013436`：nw=8 pf=1 pack+sidestream，avg **34.105 s**。每档 `max_iter=11`。不落盘 VAE cache。git `6565bf5`。
 
@@ -430,7 +484,9 @@ cache：`/data5T/chenzhi/vae_latent_cache_droid_edge_256`。原始 success 视�
 | 5 pf=2 | −2.04 s | 单独略快；RSS +64 GiB |
 | 1+5 | −1.89 s | **不叠加**：比关 pack pf=1 慢 0.5 s |
 
-### 关 pack：256p vs 480p 怎么配 prefetch
+### 7.3 关 pack 时怎么配 prefetch
+
+在线 VAE 的 2×2 见 [§7.1](#71-在线-vae不预存256p--480p--tnd--per_sample)。这里只留 pf 结论：
 
 | res | nw | pf | depth | run | avg_skip1 | min / max | HBM | RSS |
 | --- | ---: | ---: | ---: | --- | ---: | --- | ---: | ---: |
@@ -441,7 +497,7 @@ cache：`/data5T/chenzhi/vae_latent_cache_droid_edge_256`。原始 success 视�
 - **256p**：`nw=8` **`pf=2`**。AV1 要 8 worker + prefetch 才能藏住（nw=4 变成 35.2 s）。
 - **480p**：`nw=8` **`pf=1`**。关 pack 后再加 pf=2 不加速，RSS 379→460。VAE 长包才是瓶颈。
 
-480 / 256（各自最好 pf）= **31.67 / 23.30 ≈ 1.36×**。
+同 11-step 关 pack：**31.67 / 24.61 ≈ 1.29×**（不要拿 21-step 的 23.30 去除 11-step 的 31.67 得到 1.36×）。
 
 ---
 
@@ -522,6 +578,8 @@ phy 0–3，episode-id v2，`COSMOS_VAE_SKIP_VIDEO=1`，`nw=8` `pf=2` `depth=1` 
 ---
 
 ## 10. 4 卡 max-token：256/480 × TND/per_sample（09/14–09/15）
+
+这是 **钉死 `history_blocks=32`** 的天花板。日常在线 VAE 的 256p / 480p × TND / per_sample 在 [§7.1](#71-在线-vae不预存256p--480p--tnd--per_sample)。
 
 ### 10.1 扫参方法
 
@@ -667,7 +725,9 @@ chunk=24 把峰值从贴顶 65512 降到 63015，稳态时间略差（45.4 vs 43
 
 最大 ok：**52408**（相对 chunk=68 的 47452 **+4956 tok / +236 帧**）。下一档 52996 第 3 步 OOM。
 
-### 11.3 同样 T_chunk=24：256p vs 480p
+### 11.3 同样 T_chunk=24：256p vs 480p（仍是钉死 K=32）
+
+日常在线 VAE 的 2×2 见 [§7.1](#71-在线-vae不预存256p--480p--tnd--per_sample)。下面是上限扫参、history=32。
 
 480p 的 `encode_chunk_frames.480` 默认已是 24。
 

@@ -15,7 +15,7 @@
 3. [当前 TND 如何实现、利弊](#3-当前-tnd-如何实现利弊)
 4. [代码改动](#4-代码改动)
 5. [加速战役（09/09–09/13）](#5-加速战役0909-0913)
-6. [480p 与预存 VAE（09/14）](#6-480p-与预存-vae0914)
+6. [在线 VAE：256p/480p × TND/per_sample（09/14）](#6-256p-vs-480p-与-480p-优化0914)
 7. [4 卡 max-token 上限（09/14–09/15）](#7-4-卡-max-token-上限0914-0915)
 8. [当前默认与落地判定](#8-当前默认与落地判定)
 9. [环境与长跑坑](#9-环境与长跑坑)
@@ -26,7 +26,9 @@
 
 ## 1. 一句话总结
 
-8 卡 256p packing 稳态从 **57 s → 23.3 s**（TND + 关 VAE pack + `num_workers=8` + `prefetch_factor=2`）；同卡 VAE pack / sidestream 在 nw=8 之后是负优化，预存 VAE 还能再砍到 **18.4 s** 但不进默认。4 卡钉死 TF `block_size=4 / history=32` 时，**256p 长 T OOM 是 Wan VAE / CANN 3D workspace（跟 T 走），不是 TND**：256p TND 上限 **T=2233 / 47452 tok**，480p TND 能到 **T=681 / 68041 tok**。把 256p 的 `encode_chunk_frames` 从 68 降到 24，上限提到 **52408 tok**，但同 ~5 万 token 仍比 480p 慢约 30%。
+8 卡 256p packing 稳态从 **57 s → 23.3 s**（TND + 关 VAE pack + `num_workers=8` + `prefetch_factor=2`）；同卡 VAE pack / sidestream 在 nw=8 之后是负优化，预存 VAE 还能再砍到 **18.4 s** 但不进默认。
+
+**在线 VAE、不预存：** 8 卡 packing 48000、S/K 随机，256p TND **23.3 s** vs per_sample **29.9 s（−22%）**，HBM 都贴 64 GiB；480p 只有 TND **31.7 s**（1.29× 256p TND），没有 8 卡 per_sample。4 卡同 ~4.8 万 token、钉死 K=32 才有完整 2×2：480p TND 36 s vs per_sample 73 s；256p TND 在 T=2257 VAE OOM，per_sample 还能跑（76 s / 58 GiB）。
 
 ---
 
@@ -303,7 +305,77 @@ persample 200-step（09-09 MP）              57.15 s
 
 ---
 
-## 6. 480p 与预存 VAE（09/14）
+## 6. 256p vs 480p 与 480p 优化（09/14）
+
+### 6.1 在线 VAE（不预存）：256p / 480p × TND / per_sample
+
+全部 **`encode_vision_latents=false`**，Wan VAE 在 `training_step` 里和网络串行。没有 `COSMOS_VAE_LATENT_CACHE`，没有 packing 侧预编。
+
+#### 8 卡 packing 48000，S/K 随机（日常配方）
+
+S∈[1,4]、K∈[1,32] Uniform。256p `nw=8 pf=2`，480p `nw=8 pf=1`。git `6565bf5`。
+
+| 分辨率 | kernel | avg_skip1 | min–max | 峰值 HBM | RSS GiB | n | run |
+| --- | --- | ---: | --- | ---: | ---: | ---: | --- |
+| 256p | **TND** | **23.30**（21-step）；2..11 **24.61** | 20.5–27.9 | **65508** | 491 | 21 | `162502` |
+| 256p | per_sample | **29.85**；2..11 **29.29** | 24.5–35.5 | **65465** | 496 | 21 | `161144` |
+| 480p | **TND** | **31.67**（11-step） | 25.2–40.6 | **63959** | **379** | 11 | `020622` |
+| 480p | per_sample | **未测** | — | — | — | — | 没有 8 卡 480p + 在线 VAE + per_sample |
+
+| 对照 | 时间 | 显存 |
+| --- | --- | --- |
+| 256p TND vs per_sample | **23.30 vs 29.85（−22%）** | HBM 65508 vs 65465，RSS 491 vs 496，几乎一样 |
+| 480p TND vs 256p TND（同 11-step） | **31.67 vs 24.61（1.29×）** | HBM 63959 vs 65508（480p 略低）；RSS 379 vs 491（480p 帧少） |
+
+8 卡没有 480p × per_sample。完整四格只在下面 4 卡、同 token、钉死几何的扫参里。
+
+#### 4 卡、同约 48000 token：唯一完整的 2×2
+
+VAE 仍在网络里。每档 **一条** 强制长度样本（`mspb=1`，`COSMOS_FORCE_VIDEO_FRAMES`），TF **钉死 S=4、K=32**（最吃显存的一档，不是日常 Uniform）。5 step，avg = iter 2..5。phy 0–3。
+
+| 分辨率 | kernel | T | pre-TF | status | 2–5 均 / s | 峰值 HBM | RSS GiB | run |
+| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| 256p | TND | 2257 | 47956 | **oom** step1 前 | — | 64489 | 41 | `140920` |
+| 256p | TND | **2233** | 47452 | ok | **43.61** | **65512** | 49 | `n558` |
+| 256p | per_sample | 2257 | 47956 | ok | **76.45** | **58444** | 49 | `002513` |
+| 480p | TND | 477 | 47896 | ok | **35.97** | **65513** | 73 | `003428` |
+| 480p | per_sample | 477 | 47896 | ok | **73.23** | **64127** | 72 | `004012` |
+
+| 对照 | 时间 | 显存 |
+| --- | --- | --- |
+| 480p TND vs per_sample | **35.97 vs 73.23（TND −51%）** | 65513 vs 64127，两边都装得下 |
+| 256p TND vs per_sample | TND 在 T=2257 **VAE OOM**；退到 T=2233 是 **43.61 vs 76.45（−43%）** | 同 T=2257：TND 炸、per_sample 只要 58 GiB → **256p 墙在 VAE/T，不在 TND** |
+| 同 ~4.8 万 token、TND | 256p 43.61（T=2233）vs 480p **35.97**（480p 更快） | 两边都贴 64 GiB。和 8 卡随机 S/K「256p 更快」相反：这里把 256p 拉满 T，VAE 主导 |
+| 同 ~4.8 万 token、per_sample | 256p 76.45 vs 480p 73.23（接近） | 256p 58 GiB / 480p 64 GiB |
+
+钉死最大 history 时，480p TND 比 256p TND **更快**（36 vs 44 s），因为 T 只有 477；8 卡日常 packing 平均 episode 没那么长，256p 反而更快（24.6 vs 31.7 s）。
+
+### 6.2 256p vs 480p：其它路径（含预存 VAE，仅 TND）
+
+**不是** 4 卡钉死 `block_size=4 / history_blocks=32` 的上限扫参。这里 S∈[1,4]、K∈[1,32] **Uniform**，和日常训练一样。公共：8 卡 TND、`max_sequence_length=48000`、`nw=8`、git `6565bf5`。同 cap 下 256p（K=80）帧数约为 480p（K=391）的 **4.7×**，transformer token 相当。
+
+256p 用各自最好的 `pf=2`，480p 关 pack 用 `pf=1`（§6.3）。256p 关 pack 是 21-step，为对齐 480p 的 11-step，另给 iter 2..11 均值。
+
+| 路径 | 256p avg / min–max | 256p HBM / RSS | 480p avg / min–max | 480p HBM / RSS | 480÷256 |
+| --- | --- | --- | --- | --- | ---: |
+| **关 pack 在线**（现行方向） | **23.30**（21-step）/ 20.5–27.9；前 11 步 **24.61** | **65508** / 491 | **31.67**（11-step）/ 25.2–40.6 | **63959** / **379** | **1.29×**（同 11-step） |
+| pack+sidestream | 24.21 / 21.2–28.8 | 65530 / 499 | 34.11 / 24.8–41.8 | 65512 / 418 | 1.41× |
+| 指纹 cache 11-step（仍解 AV1） | **19.22** / 14.2–23.5 | 65501 / 478 | **23.71** / 14.7–32.4 | **62982** / 471 | **1.23×** |
+| episode-id 11-step（不解视频） | 20.93 / 17.4–28.9 | 63785 / **152** | 24.51 / 18.8–32.9 | 63766 / **153** | 1.17× |
+| episode-id 40-step 8 卡 | 19.81 / 15.8–29.8 | 65531 / 153 | 27.95 / 16.5–43.1 | 65510 / 155 | 1.41× |
+| 4 卡 40-step worker-load | 18.93 / 14.0–29.5 | 65527 / 77 | 25.59 / 12.1–40.4 | 65506 / 77 | 1.35× |
+
+对应 run：关 pack `162502` / `020622`；pack+stream `134951` / `013436`；指纹 `050033` / `043731`；epid 11-step `090054` / `072856`；epid 40-step `093801` / `101314`；4 卡 wload `121811` / `125719`。
+
+怎么读：
+
+- **时间**：日常 480p 大约是 256p 的 **1.2–1.4×**。关 pack 在线慢在 VAE 空间分辨率和 480p 长包（spread 15 s vs 7 s），不是 transformer token 数（cap 一样）。预存 VAE 后差距收到 **1.23×**（指纹）/ **1.17×**（epid 11-step）。
+- **NPU HBM**：packing 48000 时两边都经常贴 64 GiB。480p 关 pack 峰值 **63959 < 256p 65508**——同 token 下 480p 的 T 短（~477 vs ~2257），VAE workspace 更轻。这和钉死 K=32、把 256p 拉到 T=2233 去撞 VAE 墙不是同一件事。
+- **Host RSS**：解 AV1 时 480p 更低（379 vs 491），帧少。skip-video 之后两边都掉到 ~150 GiB（8 卡）/ ~77 GiB（4 卡），分辨率几乎没差。
+
+钉死最大 history 的上限和 256p 长 T OOM 见 [§7](#7-4-卡-max-token-上限0914-0915)，不要和本表混读。
+
+### 6.3 480p 11-step 优化
 
 基线：8 卡、TND、token cap 48000、`nw=8`、开 pack+sidestream、`pf=1`，11-step avg **34.11 s**。不落盘 cache。
 
@@ -315,9 +387,11 @@ persample 200-step（09-09 MP）              57.15 s
 | `prefetch_factor=2`（仍开 pack） | 32.06 s | 略快，RSS 418→482 |
 | 关 pack + pf=2 | 32.21 s | **不叠加**：比关 pack pf=1 还慢 0.5 s |
 
-**256p 用 `pf=2`，480p 用 `pf=1`。** 480p 关 pack 后再加 prefetch 不加速，解码已经不是瓶颈，VAE 长包才是。480 / 256 各自最好 pf = 31.67 / 23.30 ≈ **1.36×**。
+**256p 用 `pf=2`，480p 用 `pf=1`。** 480p 关 pack 后再加 prefetch 不加速，解码已经不是瓶颈，VAE 长包才是。在线 VAE 的 TND / per_sample 见 [§6.1](#61-在线-vae不预存256p--480p--tnd--per_sample)；仅 TND 含 cache 见 [§6.2](#62-256p-vs-480p其它路径含预存-vae仅-tnd)。同 11-step 关 pack **1.29×**。
 
-预存 VAE（packing 读 `.pt`，训练仍解 AV1）：
+### 6.4 预存 VAE
+
+packing 读 `.pt`，指纹路径训练仍解 AV1：
 
 | res | 路径 | avg | RSS GiB |
 | --- | --- | ---: | ---: |
@@ -334,6 +408,8 @@ persample 200-step（09-09 MP）              57.15 s
 ---
 
 ## 7. 4 卡 max-token 上限（09/14–09/15）
+
+这是 **钉死最大 history** 的天花板，不是日常对照。日常在线 VAE 的 256p vs 480p × TND / per_sample 在 [§6.1](#61-在线-vae不预存256p--480p--tnd--per_sample)。
 
 phy **0–3**，FSDP 4 卡，**一条样本填满预算**（`max_samples_per_batch=1`），VAE 在 `training_step`，TF **钉死 block_size=4、history_blocks=32**，`COSMOS_FORCE_VIDEO_FRAMES=T=1+4N`。pre-TF = `500 + K + N*(K+4)`；K=80（256p）、K=391（480p）。每档 5 step。token 间隔 ≤ 1000 停搜。
 
@@ -358,7 +434,7 @@ phy **0–3**，FSDP 4 卡，**一条样本填满预算**（`max_samples_per_bat
 
 只改 VAE 时间窗（必须是 4 的倍数）。T=2233 上 chunk 68 / 32 / 24 都能跑；chunk=24 峰值 HBM 从 65512 降到 **63015**，稳态时间 43.6→45.4 s。
 
-chunk=24 再搜上限：最大 ok **N=617 T=2469 tok=52408**（相对 chunk=68 的 47452 **+4956**）。同 ~5 万 tokens：256p 2–5 步 **49.2 s**，480p **37.7 s**（256p 慢约 **30%**）。480p 上限仍是 6.8 万（T 只有 681）。
+chunk=24 再搜上限：最大 ok **N=617 T=2469 tok=52408**（相对 chunk=68 的 47452 **+4956**）。同 ~5 万 tokens、**仍钉死 K=32**：256p 2–5 步 **49.2 s**，480p **37.7 s**（256p 慢约 **30%**）。这不是日常对照——随机 S/K、packing 48000 时 480p TND 只比 256p TND 慢约 **29%**（31.67 vs 24.61，见 [§6.1](#61-在线-vae不预存256p--480p--tnd--per_sample)）。480p 上限仍是 6.8 万（T 只有 681）。
 
 ---
 
@@ -374,7 +450,7 @@ chunk=24 再搜上限：最大 ok **N=617 T=2469 tok=52408**（相对 chunk=68 �
 | `prefetch_factor` | 2 | **2**（256p）；480p 改 1 | 480p pf=2 不加速还涨 RSS |
 | `teacher_forcing_dense_mode` | tnd | tnd | 8 卡 −11%～−22% |
 | `max_sequence_length` | 48000 | 48000 | 256p 对应 T≈2257，贴 VAE 上限 |
-| `resolution` | 256 | 256 | 同 token 比 480p 快、HBM 松（短测）；长 T 会被 VAE 卡住 |
+| `resolution` | 256 | 256 | 随机 S/K、cap 48000：256p 24.6 s vs 480p 31.7 s（1.29×），HBM 都贴 64 GiB；钉死 K=32 时长 T 会被 VAE 卡住 |
 | HCCL | 默认 AI_CPU | 同左 + `HCCL_NPU_SOCKET_PORT_RANGE` | 16666 bind |
 | 预存 VAE | 无 | env `COSMOS_VAE_LATENT_CACHE` | 可选，不进默认 |
 
