@@ -11,7 +11,7 @@
 ## 目录
 
 0. [影响 iter 时间和显存的三个因素](#0-影响-iter-时间和显存的三个因素)
-1. [当前 TND 如何实现、利弊](#1-当前-tnd-如何实现利弊)
+1. [当前 TND 如何实现、利弊](#1-当前-tnd-如何实现利弊)（Q/KV 图解：[tnd_q_kv.md](tnd_q_kv.md)）
 2. [公共配方](#2-公共配方)
 3. [256p packing 长跑 vs FSDP2 MP（09/09）](#3-256p-packing-长跑-vs-fsdp2-mp0909)
 4. [TND gather 链条（09/10–09/11）](#4-tnd-gather-链条0910-0911)
@@ -74,7 +74,7 @@ DataLoader 藏住、VAE 预存之后，剩下的是 MoT + Scheme B。双流展�
 
 **一句话：** TND 不建 Dense Mask，只把每个 causal block 真正看得见的 KV gather 成变长段，用 packed 无 mask 融合 attention 一次算完。
 
-本周对照默认的 GEN attention 是 **`teacher_forcing_dense_mode=tnd`**。可见性仍是 Scheme B teacher forcing，只换 kernel：Dense Mask + masked SDPA → 按 block gather + packed varlen 无 mask attention（Ascend 上是 `npu_fusion_attention` 的 TND 布局）。UND causal attention 三种模式都走 packed varlen，不受这个开关影响。设计背景见 [`docs/omni_mot_causal_training_implementation_zh.md`](../../../../workspace/chenzhi/cosmos-framework/docs/omni_mot_causal_training_implementation_zh.md) §7.9。
+本周对照默认的 GEN attention 是 **`teacher_forcing_dense_mode=tnd`**。可见性仍是 Scheme B teacher forcing，只换 kernel：Dense Mask + masked SDPA → 按 block gather + packed varlen 无 mask attention（Ascend 上是 `npu_fusion_attention` 的 TND 布局）。UND causal attention 三种模式都走 packed varlen，不受这个开关影响。Q / KV 用 `UND C1 C2 N1 N2` 的拼法见 [tnd_q_kv.md](tnd_q_kv.md)。设计背景见 [`docs/omni_mot_causal_training_implementation_zh.md`](../../../../workspace/chenzhi/cosmos-framework/docs/omni_mot_causal_training_implementation_zh.md) §7.9。
 
 ### 它解决什么问题
 
@@ -148,27 +148,28 @@ teacher_forcing_block_gather_attention
   CPU/fp64 测试: 按 (Q_len, KV_len) 分桶，batched unmasked SDPA，对齐 oracle
 ```
 
-#### 具体例子（1 条样本、3 block、`K=1`）
+#### 具体例子（`UND C1 C2 N1 N2`）
 
-真实 UND≈500、block 里 vis+action 很长，规则相同。这里 UND=3、每 block 2 token，packed KV = 15：
+完整图解：[tnd_q_kv.md](tnd_q_kv.md)。Q 和 KV **分开组装**。一条样本、2 个 causal block：
 
 ```text
-packed:  U0 U1 U2 | C0 | C1 | C2 | N0 | N1 | N2     下标 0..14
-GEN q:   C0 | C1 | C2 | N0 | N1 | N2                 下标 0..11（先 clean 再 noisy）
+packed KV 源序列:   [ UND | C1 C2 | N1 N2 ]
+GEN query (full_q): [ C1 C2 | N1 N2 ]
 ```
 
-`lo = max(0, i-1)`。NOISY 1 最能说明问题：
-
-| group | Q | gather 进 KV 的 slice | 不进 softmax |
+| segment | Q（view） | gathered KV | 不进 softmax |
 | --- | --- | --- | --- |
-| CLEAN 0 | C0 | U + C0 | 全部 N、未来 C |
-| CLEAN 1 | C1 | U + C0 + C1 | N、C2 |
-| CLEAN 2 | C2 | U + C1 + C2 | N、**C0 出窗** |
-| NOISY 0 | N0 | U + N0 | **C0（当前答案）** |
-| NOISY 1 | N1 | U + C0 + N1 | **C1**、N0 |
-| NOISY 2 | N2 | U + C1 + N2 | **C2**、C0 |
+| 1 | `C1` | `UND C1` | `C2`、全部 N |
+| 2 | `C2` | `UND C1 C2` | 全部 N |
+| 3 | `N1` | `UND N1` | 当前答案 `C1` |
+| 4 | `N2` | `UND C1 N2` | 当前答案 `C2`、`N1` |
 
-NOISY 1 读得了更早的 C0 和当前 N1，但 slice 停在 C1 之前。`kv_gather_index` 把上表拼成一条（UND 复制 6 次），`cu_q=[0,2,4,6,8,10,12]`，`cu_kv=[0,5,12,19,24,31,38]`。一次 packed varlen 无 mask：6 段，QK **76** 对。dense / per_sample 是 12×15=**180** 对，多出来的 104 个是空洞。样本 B 的 group 只接在后面，A 的 Q 不会 gather 到 B。
+```text
+packed Q:   [ C1 | C2 | N1 | N2 ]
+packed KV:  [ UND C1 | UND C1 C2 | UND N1 | UND C1 N2 ]
+```
+
+`N2` 读得了历史 C1 和当前 N2，slice 停在 C2 之前。UND 复制 4 次。再加 C3/N3 且 `K=1`：`C3 → UND C2 C3`（C1 出窗），`N3 → UND C2 N3`。样本 B 的 group 只接在后面，A 的 Q 不会 gather 到 B。
 
 看不见的 token 不在 gathered KV 里，所以这次 attention **不再带 mask**。noisy 读不到当前 clean，是因为 `kv_slices` 停在 `clean_start + gen_start`。GQA 在 gather 之后 `repeat_interleave` 扩 KV。分发入口：[`teacher_forcing_attention()`](../../../../workspace/chenzhi/cosmos-framework/cosmos_framework/model/generator/mot/attention.py#L289)。
 

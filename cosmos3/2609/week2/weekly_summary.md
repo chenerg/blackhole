@@ -2,7 +2,7 @@
 
 仓库：`cosmos-framework` 分支 `feat/omni-mot-causal-action-training`（相对 origin **超前 18 个 commit，未 push**）。HEAD `6565bf5`。工作区另有未提交的 recipe 默认回退、VAE latent cache、dataset hook。
 
-本周主线：在 week1 已经跑通的整 episode teacher-forcing 上，把 **8 卡 256p packing 的稳态墙钟从 ~57 s 打到 ~23 s**，并扫清 **4 卡 64 GiB 上 256p / 480p × TND / per_sample 的 token 上限**。先读 [§2 三个因素](#2-影响-iter-时间和显存的三个因素) 和 [§3 TND](#3-当前-tnd-如何实现利弊)；对比测试见 [comparison_tests.md](comparison_tests.md)。
+本周主线：在 week1 已经跑通的整 episode teacher-forcing 上，把 **8 卡 256p packing 的稳态墙钟从 ~57 s 打到 ~23 s**，并扫清 **4 卡 64 GiB 上 256p / 480p × TND / per_sample 的 token 上限**。先读 [§2 三个因素](#2-影响-iter-时间和显存的三个因素) 和 [§3 TND](#3-当前-tnd-如何实现利弊)（Q/KV 图解：[tnd_q_kv.md](tnd_q_kv.md)）；对比测试见 [comparison_tests.md](comparison_tests.md)。
 
 机器：`liteserver-8da9-2`，Ascend **910B3 × 8**，每卡 HBM 64 GiB。conda `cosmos-framework`（Python 3.11 + `torch_npu==2.10.0.post4`，CANN 9.1）。数据：`/data5T/Embodied-AI/datasets/droid_plus_lerobot_640x360_20260412`（`info.json` **500** episode / 146133 帧；`split_val_ratio=0.03` → train 485，whole-episode 丢掉 &lt;33 帧后 **484**）。
 
@@ -12,7 +12,7 @@
 
 1. [一句话总结](#1-一句话总结)
 2. [影响 iter 时间和显存的三个因素](#2-影响-iter-时间和显存的三个因素)
-3. [当前 TND 如何实现、利弊](#3-当前-tnd-如何实现利弊)
+3. [当前 TND 如何实现、利弊](#3-当前-tnd-如何实现利弊)（Q/KV 图解：[tnd_q_kv.md](tnd_q_kv.md)）
 4. [代码改动](#4-代码改动)
 5. [加速战役（09/09–09/13）](#5-加速战役0909-0913)
 6. [在线 VAE：256p/480p × TND/per_sample（09/14）](#6-256p-vs-480p-与-480p-优化0914)
@@ -97,7 +97,7 @@ DataLoader 藏住、VAE 预存之后，剩下的就是 MoT + Scheme B teacher fo
 
 **一句话：** TND 不建 Dense Mask，只把每个 causal block 真正看得见的 KV gather 成变长段，用 packed 无 mask 融合 attention 一次算完。
 
-本周对照默认的 GEN attention 是 **`teacher_forcing_dense_mode=tnd`**。可见性仍是 Scheme B teacher forcing，只换 kernel：Dense Mask + masked SDPA → 按 block gather + packed varlen 无 mask attention（Ascend 上是 `npu_fusion_attention` 的 TND 布局）。UND 的 causal attention 三种模式都走 packed varlen，不受这个开关影响。
+本周对照默认的 GEN attention 是 **`teacher_forcing_dense_mode=tnd`**。可见性仍是 Scheme B teacher forcing，只换 kernel：Dense Mask + masked SDPA → 按 block gather + packed varlen 无 mask attention（Ascend 上是 `npu_fusion_attention` 的 TND 布局）。UND 的 causal attention 三种模式都走 packed varlen，不受这个开关影响。Q / KV 用 `UND C1 C2 N1 N2` 的拼法见 [tnd_q_kv.md](tnd_q_kv.md)。
 
 更完整的 Scheme B 设计说明见仓库 [`docs/omni_mot_causal_training_implementation_zh.md`](../../../../workspace/chenzhi/cosmos-framework/docs/omni_mot_causal_training_implementation_zh.md) §7.9。下面写的是 **当前代码实际在跑的路径**。
 
@@ -182,58 +182,46 @@ teacher_forcing_block_gather_attention
       按 (query_len, kv_len) 分桶，stack 成 batched unmasked SDPA，对齐 dense oracle
 ```
 
-#### 具体例子（1 条样本、3 个 block、`history_blocks=1`）
+#### 具体例子（`UND C1 C2 N1 N2`）
 
-数字缩小方便手算。真实 UND≈500、每个 block 里是 vis+action 一长串，**切片规则相同**。
+Q 和 KV **分开组装**。完整图解（含 Dense Mask 对照、`K=1` 的 C3/N3 出窗、两条样本 packing）：[tnd_q_kv.md](tnd_q_kv.md)。
 
-一条样本：UND 3 token，3 个 causal block，每 block 2 个 GEN token。展开后 packed KV 长度 = 3 + 6 + 6 = 15：
-
-```text
-packed KV 下标
- 0  1  2 |  3  4 |  5  6 |  7  8 |  9 10 | 11 12 | 13 14
- U0 U1 U2 | C0a C0b| C1a C1b| C2a C2b| N0a N0b| N1a N1b| N2a N2b
-          |   C0   |   C1   |   C2   |   N0   |   N1   |   N2
-und_slice=(0,3)  clean_start=3  noisy_start=9
-```
-
-GEN query 张量（只含 clean+noisy，先全部 CLEAN 再全部 NOISY）：
+一条样本、2 个 causal block。packed KV 和 GEN query **不是同一套顺序**：
 
 ```text
-q:  0  1 |  2  3 |  4  5 |  6  7 |  8  9 | 10 11
-    C0a C0b| C1a C1b| C2a C2b| N0a N0b| N1a N1b| N2a N2b
+packed KV 源序列:   [ UND | C1 C2 | N1 N2 ]
+GEN query (full_q): [ C1 C2 | N1 N2 ]
 ```
 
-`lo = max(0, i - 1)`，所以 block 0 没有更早历史，block 2 看不见 C0（窗口只有 1 个 clean block）。
+`lo(i) = max(0, i-K)`。2 个 block 且 `K≥1` 时窗口盖住 C1。CLEAN 含当前 clean；NOISY **不含当前 clean**。
 
-| group | query | 看得见的 packed KV | 故意不 gather |
+| segment | Q（view） | gathered KV | 明确不看 |
 | --- | --- | --- | --- |
-| CLEAN 0 | q[0:2] C0 | U + C0 → `(0,3)+(3,5)` | 全部 noisy、未来 clean |
-| CLEAN 1 | q[2:4] C1 | U + C0 + C1 → `(0,3)+(3,7)` | noisy、C2 |
-| CLEAN 2 | q[4:6] C2 | U + C1 + C2 → `(0,3)+(5,9)` | noisy、**C0**（出窗） |
-| NOISY 0 | q[6:8] N0 | U + N0 → `(0,3)+(9,11)` | **C0**（当前答案）、N1/N2 |
-| NOISY 1 | q[8:10] N1 | U + C0 + N1 → `(0,3)+(3,5)+(11,13)` | **C1**、N0/N2 |
-| NOISY 2 | q[10:12] N2 | U + C1 + N2 → `(0,3)+(5,7)+(13,15)` | **C2**、C0、N0/N1 |
-
-NOISY 1 是最能说明问题的一格：它读得了更早的 **C0**，读得了当前 **N1**，但 `kv_slices` 在 `clean_start + gen_start=5` 处停住，**不含 C1**。如果写成 `j <= i`，训练就会抄当前 clean。
-
-`kv_gather_index` 按 group 把这些下标拼成一条（UND 出现 6 次，C0 被 CLEAN1 和 NOISY1 各拷一次）：
+| 1 | `C1` | `UND C1` | `C2`、全部 N |
+| 2 | `C2` | `UND C1 C2` | 全部 N |
+| 3 | `N1` | `UND N1` | 当前答案 `C1`、`C2`、`N2` |
+| 4 | `N2` | `UND C1 N2` | 当前答案 `C2`、`N1` |
 
 ```text
-index = [0,1,2, 3,4]             CLEAN0   5 tok
-      + [0,1,2, 3,4,5,6]         CLEAN1   7
-      + [0,1,2, 5,6,7,8]         CLEAN2   7
-      + [0,1,2, 9,10]            NOISY0   5
-      + [0,1,2, 3,4, 11,12]      NOISY1   7
-      + [0,1,2, 5,6, 13,14]      NOISY2   7
-cu_q  = [0, 2, 4, 6, 8, 10, 12]
-cu_kv = [0, 5, 12, 19, 24, 31, 38]
+packed Q  (连续切片，不复制):   [ C1 | C2 | N1 | N2 ]
+packed KV (gather，重叠复制):  [ UND C1 | UND C1 C2 | UND N1 | UND C1 N2 ]
 ```
 
-NPU 上 `K/V.index_select(0, index)` 之后，一次 packed varlen 无 mask attention：第 `j` 段 Q 只对第 `j` 段 gathered KV 做 softmax。6 个 segment，QK pair 合计 **2×(5+7+7+5+7+7)=76**。
+UND 复制 4 次，C1 出现 3 次（自己、C2 历史、N2 历史）。每个 segment 内部 unmasked：`C1` 只和自己那段 `UND C1` 做 softmax。
 
-同一条样本若走 dense mask：12 个 query × 15 个 key = **180** 个 QK，其中 104 个是被 mask 掉的空洞（跨流、出窗、当前 clean），算力照花、还要存 12×15 的 bool。`per_sample` 对单条样本同样是 12×15；TND 把那 104 个根本不 gather。
+展开成 mask 就是 oracle 的非零位置（`.` 不进 softmax）：
 
-再 pack 进样本 B 时，B 的 group 接在 `cu_q` / `cu_kv` 后面，KV 下标落在 B 自己的 packed 区间。A 的 Q 不会 gather 到 B 的 token，不用 same-sample bit。
+```text
+         UND  C1  C2  N1  N2
+    C1    ✓   ✓   .   .   .
+    C2    ✓   ✓   ✓   .   .
+    N1    ✓   .   .   ✓   .
+    N2    ✓   ✓   .   .   ✓
+```
+
+`N2` 是最能说明问题的一格：读得了历史 **C1** 和当前 **N2**，但 gather 在当前 clean 前停住，**不含 C2**。写成 `j <= i` 就会抄答案。
+
+再加 C3/N3 且 `K=1` 才看得出窗口裁剪：`C3 → UND C2 C3`（C1 出窗），`N3 → UND C2 N3`（看不到当前答案 C3）。样本 B 的 group 只接在 `cu_q` / `cu_kv` 后面，A 的 Q 不会 gather 到 B。
 
 关键约束与实现细节：
 
@@ -548,6 +536,7 @@ chunk=24 再搜上限：最大 ok **N=617 T=2469 tok=52408**（相对 chunk=68 �
 
 | 内容 | 路径 |
 | --- | --- |
+| TND Q/KV 图解（`UND C1 C2 N1 N2`） | [tnd_q_kv.md](tnd_q_kv.md) |
 | 对比测试全文（配置 + 结果表） | [comparison_tests.md](comparison_tests.md) |
 | 实验目录 / 索引 | `cosmos-framework/experiments/INDEX.md` |
 | 09-11 战役 | `experiments/20260911_droid_edge_tf_opt_campaign.md` |
