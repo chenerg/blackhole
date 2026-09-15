@@ -182,6 +182,59 @@ teacher_forcing_block_gather_attention
       按 (query_len, kv_len) 分桶，stack 成 batched unmasked SDPA，对齐 dense oracle
 ```
 
+#### 具体例子（1 条样本、3 个 block、`history_blocks=1`）
+
+数字缩小方便手算。真实 UND≈500、每个 block 里是 vis+action 一长串，**切片规则相同**。
+
+一条样本：UND 3 token，3 个 causal block，每 block 2 个 GEN token。展开后 packed KV 长度 = 3 + 6 + 6 = 15：
+
+```text
+packed KV 下标
+ 0  1  2 |  3  4 |  5  6 |  7  8 |  9 10 | 11 12 | 13 14
+ U0 U1 U2 | C0a C0b| C1a C1b| C2a C2b| N0a N0b| N1a N1b| N2a N2b
+          |   C0   |   C1   |   C2   |   N0   |   N1   |   N2
+und_slice=(0,3)  clean_start=3  noisy_start=9
+```
+
+GEN query 张量（只含 clean+noisy，先全部 CLEAN 再全部 NOISY）：
+
+```text
+q:  0  1 |  2  3 |  4  5 |  6  7 |  8  9 | 10 11
+    C0a C0b| C1a C1b| C2a C2b| N0a N0b| N1a N1b| N2a N2b
+```
+
+`lo = max(0, i - 1)`，所以 block 0 没有更早历史，block 2 看不见 C0（窗口只有 1 个 clean block）。
+
+| group | query | 看得见的 packed KV | 故意不 gather |
+| --- | --- | --- | --- |
+| CLEAN 0 | q[0:2] C0 | U + C0 → `(0,3)+(3,5)` | 全部 noisy、未来 clean |
+| CLEAN 1 | q[2:4] C1 | U + C0 + C1 → `(0,3)+(3,7)` | noisy、C2 |
+| CLEAN 2 | q[4:6] C2 | U + C1 + C2 → `(0,3)+(5,9)` | noisy、**C0**（出窗） |
+| NOISY 0 | q[6:8] N0 | U + N0 → `(0,3)+(9,11)` | **C0**（当前答案）、N1/N2 |
+| NOISY 1 | q[8:10] N1 | U + C0 + N1 → `(0,3)+(3,5)+(11,13)` | **C1**、N0/N2 |
+| NOISY 2 | q[10:12] N2 | U + C1 + N2 → `(0,3)+(5,7)+(13,15)` | **C2**、C0、N0/N1 |
+
+NOISY 1 是最能说明问题的一格：它读得了更早的 **C0**，读得了当前 **N1**，但 `kv_slices` 在 `clean_start + gen_start=5` 处停住，**不含 C1**。如果写成 `j <= i`，训练就会抄当前 clean。
+
+`kv_gather_index` 按 group 把这些下标拼成一条（UND 出现 6 次，C0 被 CLEAN1 和 NOISY1 各拷一次）：
+
+```text
+index = [0,1,2, 3,4]             CLEAN0   5 tok
+      + [0,1,2, 3,4,5,6]         CLEAN1   7
+      + [0,1,2, 5,6,7,8]         CLEAN2   7
+      + [0,1,2, 9,10]            NOISY0   5
+      + [0,1,2, 3,4, 11,12]      NOISY1   7
+      + [0,1,2, 5,6, 13,14]      NOISY2   7
+cu_q  = [0, 2, 4, 6, 8, 10, 12]
+cu_kv = [0, 5, 12, 19, 24, 31, 38]
+```
+
+NPU 上 `K/V.index_select(0, index)` 之后，一次 packed varlen 无 mask attention：第 `j` 段 Q 只对第 `j` 段 gathered KV 做 softmax。6 个 segment，QK pair 合计 **2×(5+7+7+5+7+7)=76**。
+
+同一条样本若走 dense mask：12 个 query × 15 个 key = **180** 个 QK，其中 104 个是被 mask 掉的空洞（跨流、出窗、当前 clean），算力照花、还要存 12×15 的 bool。`per_sample` 对单条样本同样是 12×15；TND 把那 104 个根本不 gather。
+
+再 pack 进样本 B 时，B 的 group 接在 `cu_q` / `cu_kv` 后面，KV 下标落在 B 自己的 packed 区间。A 的 Q 不会 gather 到 B 的 token，不用 same-sample bit。
+
 关键约束与实现细节：
 
 - Query groups 必须覆盖全部 GEN query、不重叠（[`_validate_block_attention_groups`](../../../../workspace/chenzhi/cosmos-framework/cosmos_framework/model/generator/mot/teacher_forcing_attention.py#L133)）。先发完一条 sample 的全部 CLEAN group，再发 NOISY，拼接 GEN 是一段连续分区。

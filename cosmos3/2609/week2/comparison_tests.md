@@ -148,6 +148,28 @@ teacher_forcing_block_gather_attention
   CPU/fp64 测试: 按 (Q_len, KV_len) 分桶，batched unmasked SDPA，对齐 oracle
 ```
 
+#### 具体例子（1 条样本、3 block、`K=1`）
+
+真实 UND≈500、block 里 vis+action 很长，规则相同。这里 UND=3、每 block 2 token，packed KV = 15：
+
+```text
+packed:  U0 U1 U2 | C0 | C1 | C2 | N0 | N1 | N2     下标 0..14
+GEN q:   C0 | C1 | C2 | N0 | N1 | N2                 下标 0..11（先 clean 再 noisy）
+```
+
+`lo = max(0, i-1)`。NOISY 1 最能说明问题：
+
+| group | Q | gather 进 KV 的 slice | 不进 softmax |
+| --- | --- | --- | --- |
+| CLEAN 0 | C0 | U + C0 | 全部 N、未来 C |
+| CLEAN 1 | C1 | U + C0 + C1 | N、C2 |
+| CLEAN 2 | C2 | U + C1 + C2 | N、**C0 出窗** |
+| NOISY 0 | N0 | U + N0 | **C0（当前答案）** |
+| NOISY 1 | N1 | U + C0 + N1 | **C1**、N0 |
+| NOISY 2 | N2 | U + C1 + N2 | **C2**、C0 |
+
+NOISY 1 读得了更早的 C0 和当前 N1，但 slice 停在 C1 之前。`kv_gather_index` 把上表拼成一条（UND 复制 6 次），`cu_q=[0,2,4,6,8,10,12]`，`cu_kv=[0,5,12,19,24,31,38]`。一次 packed varlen 无 mask：6 段，QK **76** 对。dense / per_sample 是 12×15=**180** 对，多出来的 104 个是空洞。样本 B 的 group 只接在后面，A 的 Q 不会 gather 到 B。
+
 看不见的 token 不在 gathered KV 里，所以这次 attention **不再带 mask**。noisy 读不到当前 clean，是因为 `kv_slices` 停在 `clean_start + gen_start`。GQA 在 gather 之后 `repeat_interleave` 扩 KV。分发入口：[`teacher_forcing_attention()`](../../../../workspace/chenzhi/cosmos-framework/cosmos_framework/model/generator/mot/attention.py#L289)。
 
 这不是 Scheme A（先 clean forward 存逐层可微 KV），也不是多次 attention 再 LSE 合并。仍是 Scheme B 一次 joint forward，只是 softmax 作用在 gather 出来的可见 KV 上。与 dense SDPA **不要求 bitwise** 一致（tiling / softmax 归约 / BF16 累加不同）。
